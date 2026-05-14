@@ -6,9 +6,16 @@ import wave
 import datetime
 import traceback
 import logging
+import aiohttp
 import discord
 from discord.ext import commands, voice_recv
 import discord.gateway
+
+try:
+    from discord.gateway import WebSocketClosure
+except ImportError:
+    class WebSocketClosure(Exception):
+        pass
 
 # ─────────────────────────────────────────────────────
 # DAVE (Discord Audio Video Encryption) — davey binding
@@ -153,10 +160,20 @@ async def _on_session_description(ws):
         return
     if not DAVE_AVAILABLE:
         return
-    user_id = getattr(ws, "_user_id", 0) or 0
-    channel_id = getattr(ws, "_channel_id", 0) or 0
+
+    # user_id: ID del bot
+    user_id = bot.user.id if bot.user else 0
+
+    # channel_id: canal de voz al que está conectado
+    vc = getattr(ws, "_connection", None)
+    channel_id = 0
+    if vc:
+        channel = getattr(vc, "channel", None)
+        if channel:
+            channel_id = channel.id
+
     _dave_sessions[guild_id] = DAVESession(user_id, channel_id)
-    logging.info(f"DAVESession registrada para guild={guild_id}")
+    logging.info(f"DAVESession registrada guild={guild_id} user={user_id} channel={channel_id}")
 
 
 async def _handle_dave_json(ws, op: int, data: dict):
@@ -240,6 +257,41 @@ def _get_guild_id(ws) -> int:
 
 
 discord.gateway.DiscordVoiceWebSocket.received_message = _dave_received_message
+
+
+# ─────────────────────────────────────────────────────
+# Patch de poll_event para capturar frames binarios DAVE
+#
+# discord.py descarta frames binarios del Voice Gateway.
+# Los MLS opcodes 25-31 llegan como binary WebSocket frames
+# y necesitan ser interceptados acá antes de que se pierdan.
+# ─────────────────────────────────────────────────────
+
+_orig_poll_event = discord.gateway.DiscordVoiceWebSocket.poll_event
+
+
+async def _dave_poll_event(self) -> None:
+    try:
+        msg = await asyncio.wait_for(self.ws.receive(), timeout=30.0)
+    except asyncio.TimeoutError:
+        await _orig_poll_event(self)
+        return
+
+    if msg.type is aiohttp.WSMsgType.BINARY:
+        logging.info(
+            f"DAVE binary frame: {len(msg.data)}b "
+            f"header={msg.data[:4].hex() if len(msg.data) >= 4 else msg.data.hex()}"
+        )
+        await _handle_dave_binary(self, msg.data)
+    elif msg.type is aiohttp.WSMsgType.TEXT:
+        await self.received_message(discord.utils._from_json(msg.data))
+    elif msg.type is aiohttp.WSMsgType.ERROR:
+        raise msg.data
+    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSE):
+        raise WebSocketClosure
+
+
+discord.gateway.DiscordVoiceWebSocket.poll_event = _dave_poll_event
 
 
 # ─────────────────────────────────────────────────────
