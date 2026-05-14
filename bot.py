@@ -165,12 +165,12 @@ async def _on_session_description(ws):
     user_id = bot.user.id if bot.user else 0
 
     # channel_id: canal de voz al que está conectado
-    vc = getattr(ws, "_connection", None)
     channel_id = 0
-    if vc:
-        channel = getattr(vc, "channel", None)
-        if channel:
-            channel_id = channel.id
+    guild = bot.get_guild(guild_id)
+    if guild and guild.voice_client and hasattr(guild.voice_client, "channel"):
+        ch = guild.voice_client.channel
+        if ch:
+            channel_id = ch.id
 
     _dave_sessions[guild_id] = DAVESession(user_id, channel_id)
     logging.info(f"DAVESession registrada guild={guild_id} user={user_id} channel={channel_id}")
@@ -192,35 +192,45 @@ async def _handle_dave_json(ws, op: int, data: dict):
 
 
 async def _handle_dave_binary(ws, data: bytes):
-    if len(data) < 2:
+    # Formato observado: [0x00][seq: 1 byte][opcode: 1 byte][payload...]
+    if len(data) < 3:
         return
 
-    opcode = data[0]
-    guild_id = _get_guild_id(ws)
-    session = _dave_sessions.get(guild_id)
+    sequence = data[1]
+    opcode   = data[2]
+    payload  = data[3:]
 
-    logging.info(f"DAVE binary: opcode={opcode}, len={len(data)}, guild={guild_id}")
+    guild_id = _get_guild_id(ws)
+    session  = _dave_sessions.get(guild_id)
+
+    logging.info(f"DAVE binary: op={opcode}(0x{opcode:02x}) seq={sequence} payload={len(payload)}b guild={guild_id}")
 
     if not session:
         logging.warning("DAVE binary: no hay sesión activa")
         return
 
     if opcode == MLS_EXTERNAL_SENDER:
-        logging.info("DAVE: MLS_EXTERNAL_SENDER")
-        session.set_external_sender(data[3:])
+        logging.info("DAVE: MLS_EXTERNAL_SENDER → set_external_sender + enviando key package")
+        session.set_external_sender(payload)
+        # Después de recibir el external sender enviamos nuestro key package proactivamente
+        key_pkg = session.get_key_package()
+        if key_pkg:
+            logging.info(f"DAVE: enviando key package ({len(key_pkg)}b)")
+            await ws.send(struct.pack("!B", MLS_KEY_PACKAGE) + key_pkg)
 
     elif opcode == MLS_KEY_PACKAGE:
-        logging.info("DAVE: MLS_KEY_PACKAGE → enviando key package")
+        # Discord solicita explícitamente nuestro key package
+        logging.info("DAVE: MLS_KEY_PACKAGE solicitado → enviando key package")
         key_pkg = session.get_key_package()
         if key_pkg:
             await ws.send(struct.pack("!B", MLS_KEY_PACKAGE) + key_pkg)
 
     elif opcode == MLS_PROPOSALS:
-        logging.info("DAVE: MLS_PROPOSALS")
-        if len(data) < 4:
+        logging.info("DAVE: MLS_PROPOSALS → procesando")
+        if len(payload) < 1:
             return
-        op_type = data[3]
-        result = session.process_proposals(op_type, data[4:], [])
+        op_type = payload[0]
+        result = session.process_proposals(op_type, payload[1:], [])
         if result:
             commit_payload = result.commit
             if hasattr(result, "welcome") and result.welcome:
@@ -229,18 +239,21 @@ async def _handle_dave_binary(ws, data: bytes):
 
     elif opcode == MLS_ANNOUNCE_COMMIT_TRANSITION:
         logging.info("DAVE: MLS_ANNOUNCE_COMMIT_TRANSITION → sesión activa")
-        if len(data) >= 5:
-            transition_id = struct.unpack("!H", data[3:5])[0]
-            session.process_commit(data[5:])
+        if len(payload) >= 2:
+            transition_id = struct.unpack("!H", payload[0:2])[0]
+            session.process_commit(payload[2:])
             await ws.send({"op": DAVE_TRANSITION_READY, "d": {"transition_id": transition_id}})
 
     elif opcode == MLS_WELCOME:
-        logging.info("DAVE: MLS_WELCOME")
-        session.process_welcome(data[5:] if len(data) > 5 else b"")
+        logging.info("DAVE: MLS_WELCOME → procesando welcome")
+        session.process_welcome(payload)
 
     elif opcode == MLS_INVALID_COMMIT_WELCOME:
         logging.warning("DAVE: commit inválido → reset sesión")
         session.reset()
+
+    else:
+        logging.info(f"DAVE: opcode desconocido {opcode}(0x{opcode:02x})")
 
 
 def _get_guild_id(ws) -> int:
