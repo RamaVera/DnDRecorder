@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import os
+import wave
 import datetime
 import traceback
 import logging
@@ -72,34 +73,23 @@ async def join(ctx):
 # =========================
 # COMANDO START (CORREGIDO)
 # =========================
-class SafeWaveSink(voice_recv.WaveSink):
-    def write(self, user, data):
-        try:
-            # Si el paquete de audio está bien, lo escribe
-            super().write(user, data)
-        except Exception:
-            # Si el paquete viene corrupto (el error Opus), lo ignoramos
-            # para que el proceso no muera
-            pass
-
-
-class RawOpusSink(voice_recv.AudioSink):
+class PcmWavSink(voice_recv.AudioSink):
     def __init__(self, filename):
         super().__init__()
-        # Abrimos un archivo simple, no un .wav, porque el audio estará cifrado/comprimido
-        self.file = open(filename, 'wb')
+        self._wav = wave.open(filename, 'wb')
+        self._wav.setnchannels(2)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(48000)
 
     def wants_opus(self) -> bool:
-        # Esto saltea el decodificador que está fallando
-        return True
+        return False
 
     def write(self, user, data):
-        # Escribimos los bytes de Opus directamente
-        if data.opus:
-            self.file.write(data.opus)
+        if data.pcm:
+            self._wav.writeframes(data.pcm)
 
     def cleanup(self):
-        self.file.close()
+        self._wav.close()
 
 
 @bot.command()
@@ -108,18 +98,13 @@ async def start(ctx):
     if not vc or not isinstance(vc, voice_recv.VoiceRecvClient):
         return await ctx.send("¡Uní al bot con !join primero!")
 
-    ahora = datetime.datetime.now().strftime("%H%M%S")
-    # Guardamos como .opus para procesarlo después
-    filepath = os.path.join(AUDIO_DIR, f"raw_audio_{ahora}.opus")
+    ahora = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(AUDIO_DIR, f"grabacion_{ahora}.wav")
 
     try:
-        sink = RawOpusSink(filepath)
-
-        await ctx.send("📡 Iniciando recepción de paquetes crudos...")
-        await asyncio.sleep(2)
-
+        sink = PcmWavSink(filepath)
         vc.listen(sink)
-        await ctx.send(f"🔴 **Grabando bytes.** Archivo: `{filepath}`")
+        await ctx.send(f"🔴 **Grabando.** Archivo: `{filepath}`")
     except Exception as e:
         await ctx.send(f"Error: {e}")
 
