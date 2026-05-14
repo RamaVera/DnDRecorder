@@ -23,6 +23,16 @@ if sys.platform == 'win32':
 # Configuración de logs para ver qué pasa con la voz
 logging.basicConfig(level=logging.INFO)
 
+_orig_decode = discord.opus.Decoder.decode
+
+def _safe_decode(self, data, *, fec=False):
+    try:
+        return _orig_decode(self, data, fec=fec)
+    except discord.opus.OpusError:
+        return bytes(3840)
+
+discord.opus.Decoder.decode = _safe_decode
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
